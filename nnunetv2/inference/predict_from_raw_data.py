@@ -45,7 +45,8 @@ class nnUNetPredictor(object):
                  device: torch.device = torch.device('cuda'),
                  verbose: bool = False,
                  verbose_preprocessing: bool = False,
-                 allow_tqdm: bool = True):
+                 allow_tqdm: bool = True,
+                 num_stochastic_passes: int = 1):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
@@ -56,6 +57,12 @@ class nnUNetPredictor(object):
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
         self.use_mirroring = use_mirroring
+        self.num_stochastic_passes = num_stochastic_passes
+
+        if self.num_stochastic_passes > 1:
+            self.use_mirroring = False
+            print("Warning: Test-time augmentation (mirroring) is disabled during stochastic prediction (num_stochastic_passes > 1).")
+
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
         else:
@@ -382,26 +389,36 @@ class nnUNetPredictor(object):
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                # prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                mean_logits, variance_map = self.predict_logits_from_preprocessed_data(data)
+                mean_logits_np = mean_logits.cpu().detach().numpy()
+                variance_map_np = variance_map.cpu().detach().numpy()
+
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
                         export_pool.starmap_async(
                             export_prediction_from_logits,
-                            ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
+                            ((mean_logits_np, properties, self.configuration_manager, self.plans_manager,
+                              self.dataset_json, ofile, save_probabilities, variance_map_np),)
                         )
                     )
                 else:
                     print('sending off prediction to background worker for resampling')
+                    # Note: convert_predicted_logits_to_segmentation_with_correct_shape now also needs to handle variance_map
+                    # This might require changes in its signature and logic if variance is to be returned here.
+                    # For now, assuming it primarily processes mean_logits for direct return scenarios.
+                    # If variance_map needs to be returned by this path, convert_predicted_logits_to_segmentation_with_correct_shape
+                    # will need further adaptation beyond just passing it.
                     r.append(
                         export_pool.starmap_async(
                             convert_predicted_logits_to_segmentation_with_correct_shape, (
-                                (prediction, self.plans_manager,
+                                (mean_logits_np, self.plans_manager, # Pass mean_logits_np
                                  self.configuration_manager, self.label_manager,
                                  properties,
-                                 save_probabilities),)
+                                 save_probabilities,
+                                 variance_map_np),) # Pass variance_map_np
                         )
                     )
                 if ofile is not None:
@@ -477,30 +494,50 @@ class nnUNetPredictor(object):
         """
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
-        prediction = None
+        
+        all_predictions = []
 
-        for params in self.list_of_parameters:
+        for _ in range(self.num_stochastic_passes):
+            current_pass_predictions = []
+            for params in self.list_of_parameters:
+                # messing with state dict names...
+                if not isinstance(self.network, OptimizedModule):
+                    self.network.load_state_dict(params)
+                else:
+                    self.network._orig_mod.load_state_dict(params)
+                
+                current_model_prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+                current_pass_predictions.append(current_model_prediction)
 
-            # messing with state dict names...
-            if not isinstance(self.network, OptimizedModule):
-                self.network.load_state_dict(params)
+            if not current_pass_predictions: # Should not happen if list_of_parameters is not empty
+                if self.verbose: print('No parameters found, returning empty prediction.')
+                torch.set_num_threads(n_threads)
+                return torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]), device='cpu'), \
+                       torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]), device='cpu')
+
+
+            # Average predictions if ensembling models for the current stochastic pass
+            if len(current_pass_predictions) > 1:
+                current_pass_prediction_ensembled = torch.stack(current_pass_predictions).mean(dim=0)
             else:
-                self.network._orig_mod.load_state_dict(params)
+                current_pass_prediction_ensembled = current_pass_predictions[0]
+            
+            all_predictions.append(current_pass_prediction_ensembled)
 
-            # why not leave prediction on device if perform_everything_on_device? Because this may cause the
-            # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
-            # this actually saves computation time
-            if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
-            else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
+        all_predictions_tensor = torch.stack(all_predictions)
 
-        if len(self.list_of_parameters) > 1:
-            prediction /= len(self.list_of_parameters)
+        # Calculate Mean Logits
+        mean_logits = torch.mean(all_predictions_tensor, dim=0)
+
+        # Calculate Variance
+        # Probabilities have shape [T, C, H, W, D] or [T, C, H, W]
+        probabilities = torch.softmax(all_predictions_tensor, dim=2) # dim=2 because 0 is T, 1 is num_models (already averaged), 2 is C 
+        variance_map = torch.var(probabilities, dim=0)
+        # The variance_map will have shape [C, H, W, D] or [C, H, W]
 
         if self.verbose: print('Prediction done')
         torch.set_num_threads(n_threads)
-        return prediction
+        return mean_logits, variance_map
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
@@ -539,6 +576,11 @@ class nnUNetPredictor(object):
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+        
+        original_training_mode = self.network.training
+        if self.num_stochastic_passes > 1:
+            self.network.train()
+
         prediction = self.network(x)
 
         if mirror_axes is not None:
@@ -553,6 +595,10 @@ class nnUNetPredictor(object):
             for axes in axes_combinations:
                 prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
             prediction /= (len(axes_combinations) + 1)
+
+        if self.num_stochastic_passes > 1:
+            self.network.train(original_training_mode)
+
         return prediction
 
     @torch.inference_mode()
@@ -814,6 +860,9 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--num_stochastic_passes', type=int, default=1, required=False,
+                        help='Number of stochastic forward passes for Monte Carlo Dropout. Default is 1 (no MCD). '
+                             'If > 1, enables MCD and disables test-time augmentation.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -850,7 +899,8 @@ def predict_entry_point_modelfolder():
                                 device=device,
                                 verbose=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar,
-                                verbose_preprocessing=args.verbose)
+                                verbose_preprocessing=args.verbose,
+                                num_stochastic_passes=args.num_stochastic_passes)
     predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
     predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                  overwrite=not args.continue_prediction,
@@ -923,6 +973,9 @@ def predict_entry_point():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--num_stochastic_passes', type=int, default=1, required=False,
+                        help='Number of stochastic forward passes for Monte Carlo Dropout. Default is 1 (no MCD). '
+                             'If > 1, enables MCD and disables test-time augmentation.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -964,7 +1017,8 @@ def predict_entry_point():
                                 device=device,
                                 verbose=args.verbose,
                                 verbose_preprocessing=args.verbose,
-                                allow_tqdm=not args.disable_progress_bar)
+                                allow_tqdm=not args.disable_progress_bar,
+                                num_stochastic_passes=args.num_stochastic_passes)
     predictor.initialize_from_trained_model_folder(
         model_folder,
         args.f,
