@@ -71,69 +71,129 @@ class nnUNetPredictor(object):
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
 
-    def initialize_from_trained_model_folder(self, model_training_output_dir: str,
-                                             use_folds: Union[Tuple[Union[int, str]], None],
+    def initialize_from_trained_model_folder(self, model_training_output_dirs: Union[str, List[str]],
+                                             fold_or_folds: Union[int, str, Tuple[Union[int, str], ...], List[Union[int, str, Tuple[Union[int, str], ...]]], None],
                                              checkpoint_name: str = 'checkpoint_final.pth'):
         """
-        This is used when making predictions with a trained model
+        This is used when making predictions with a trained model.
+        Can now handle a single model directory or a list of model directories for ensemble prediction.
         """
-        if use_folds is None:
-            use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
+        if isinstance(model_training_output_dirs, str):
+            model_training_output_dirs = [model_training_output_dirs]
 
-        dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
-        plans = load_json(join(model_training_output_dir, 'plans.json'))
-        plans_manager = PlansManager(plans)
+        self.list_of_list_of_parameters = [] 
 
-        if isinstance(use_folds, str):
-            use_folds = [use_folds]
+        for i, model_dir in enumerate(model_training_output_dirs):
+            if self.verbose:
+                print(f"Initializing model {i + 1}/{len(model_training_output_dirs)} from: {model_dir}")
 
-        parameters = []
-        for i, f in enumerate(use_folds):
-            f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                    map_location=torch.device('cpu'), weights_only=False)
-            if i == 0:
-                trainer_name = checkpoint['trainer_name']
-                configuration_name = checkpoint['init_args']['configuration']
-                inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
-                    'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+            current_model_folds_config: Union[int, str, Tuple[Union[int, str], ...], None]
+            if isinstance(fold_or_folds, list): 
+                if len(fold_or_folds) != len(model_training_output_dirs):
+                    raise ValueError(f"If fold_or_folds is a list (len {len(fold_or_folds)}), its length must match "
+                                     f"model_training_output_dirs (len {len(model_training_output_dirs)}).")
+                current_model_folds_config = fold_or_folds[i]
+            else: 
+                current_model_folds_config = fold_or_folds
+            
+            current_model_folds_iterable: Union[Tuple[Union[int, str], ...], List[Union[int, str]]]
+            if current_model_folds_config is None: 
+                detected_folds = nnUNetPredictor.auto_detect_available_folds(model_dir, checkpoint_name)
+                if not detected_folds: 
+                     raise RuntimeError(f"Could not find any folds in {model_dir} for checkpoint {checkpoint_name}")
+                current_model_folds_iterable = detected_folds
+            elif isinstance(current_model_folds_config, (int, str)): 
+                current_model_folds_iterable = [current_model_folds_config]
+            else: 
+                current_model_folds_iterable = current_model_folds_config
 
-            parameters.append(checkpoint['network_weights'])
 
-        configuration_manager = plans_manager.get_configuration(configuration_name)
-        # restore network
-        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
-                                                    trainer_name, 'nnunetv2.training.nnUNetTrainer')
-        if trainer_class is None:
-            raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
-                               f'Please place it there (in any .py file)!')
-        network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
-        )
+            if i == 0:  # Initialize plans, dataset_json, network from the first model
+                self.dataset_json = load_json(join(model_dir, 'dataset.json'))
+                self.plans_manager = PlansManager(load_json(join(model_dir, 'plans.json')))
+                
+                first_fold_for_init = current_model_folds_iterable[0]
+                first_fold_for_init = int(first_fold_for_init) if first_fold_for_init != 'all' else first_fold_for_init
+                
+                checkpoint_path = join(model_dir, f'fold_{first_fold_for_init}', checkpoint_name)
+                if not isfile(checkpoint_path):
+                    raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=False)
+                
+                self.trainer_name = checkpoint['trainer_name']
+                
+                if 'init_args' not in checkpoint or 'configuration' not in checkpoint['init_args']:
+                    if self.verbose:
+                        print(f"Warning: Checkpoint {checkpoint_path} does not contain 'init_args.configuration'. "
+                              "Attempting to infer from plans.json or default.")
+                    if len(self.plans_manager.available_configurations) == 1:
+                        configuration_name = list(self.plans_manager.available_configurations.keys())[0]
+                        if self.verbose: print(f"Inferred configuration '{configuration_name}' from plans.")
+                    else:
+                        found_config = None
+                        for preferred_config in ["3d_fullres", "2d"]: 
+                            if preferred_config in self.plans_manager.available_configurations:
+                                configuration_name = preferred_config
+                                if self.verbose: print(f"Found preferred configuration '{configuration_name}' in plans.")
+                                found_config = True
+                                break
+                        if not found_config:
+                            raise RuntimeError(f"Checkpoint {checkpoint_path} is missing 'init_args.configuration' and "
+                                               "could not unambiguously determine configuration from plans.json. "
+                                               f"Available configurations: {list(self.plans_manager.available_configurations.keys())}")
+                else:
+                    configuration_name = checkpoint['init_args']['configuration']
 
-        self.plans_manager = plans_manager
-        self.configuration_manager = configuration_manager
-        self.list_of_parameters = parameters
+                self.configuration_manager = self.plans_manager.get_configuration(configuration_name)
+                self.allowed_mirroring_axes = checkpoint.get('inference_allowed_mirroring_axes')
+                self.label_manager = self.plans_manager.get_label_manager(self.dataset_json)
 
-        # initialize network with first set of parameters, also see https://github.com/MIC-DKFZ/nnUNet/issues/2520
-        network.load_state_dict(parameters[0])
+                num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
+                                                                   self.dataset_json)
+                trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
+                                                            self.trainer_name, 'nnunetv2.training.nnUNetTrainer')
+                if trainer_class is None:
+                    raise RuntimeError(
+                        f'Unable to locate trainer class {self.trainer_name} in nnunetv2.training.nnUNetTrainer.')
+                
+                self.network = trainer_class.build_network_architecture(
+                    self.configuration_manager.network_arch_class_name,
+                    self.configuration_manager.network_arch_init_kwargs,
+                    self.configuration_manager.network_arch_init_kwargs_req_import,
+                    num_input_channels,
+                    self.label_manager.num_segmentation_heads,
+                    enable_deep_supervision=False 
+                )
+                if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
+                        and not isinstance(self.network, OptimizedModule):
+                    if self.verbose: print('Using torch.compile for the network.')
+                    self.network = torch.compile(self.network)
+            else:
+                dataset_json_member = load_json(join(model_dir, 'dataset.json'))
+                if dataset_json_member['name'] != self.dataset_json['name']:
+                    # For nnUNetPredictor, direct print is fine as it doesn't have a logger like trainer
+                    print(f"Warning: Ensembling models from different datasets? "
+                          f"Model 1: {self.dataset_json['name']}, Model {i + 1}: {dataset_json_member['name']}")
 
-        self.network = network
+            member_parameters_for_folds = []
+            for f_val in current_model_folds_iterable:
+                f_val_processed = int(f_val) if f_val != 'all' else f_val
+                checkpoint_path = join(model_dir, f'fold_{f_val_processed}', checkpoint_name)
+                if not isfile(checkpoint_path):
+                     raise FileNotFoundError(f"Checkpoint file not found for model {model_dir}, fold {f_val_processed}: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=False)
+                member_parameters_for_folds.append(checkpoint['network_weights'])
+            self.list_of_list_of_parameters.append(member_parameters_for_folds)
 
-        self.dataset_json = dataset_json
-        self.trainer_name = trainer_name
-        self.allowed_mirroring_axes = inference_allowed_mirroring_axes
-        self.label_manager = plans_manager.get_label_manager(dataset_json)
-        if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
-                and not isinstance(self.network, OptimizedModule):
-            print('Using torch.compile')
-            self.network = torch.compile(self.network)
+        if not self.list_of_list_of_parameters or not self.list_of_list_of_parameters[0]:
+            raise RuntimeError("No parameters were loaded. Check model directories, folds, and checkpoint names.")
+        
+        self.network.load_state_dict(self.list_of_list_of_parameters[0][0])
+        
+        # self.list_of_parameters is part of the old API, clear it to avoid confusion
+        # It was used in predict_logits_from_preprocessed_data
+        self.list_of_parameters = None # Set to None to ensure it's not accidentally used
+
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
                               configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
@@ -495,49 +555,71 @@ class nnUNetPredictor(object):
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         
-        all_predictions = []
+        all_member_probabilities = []
 
-        for _ in range(self.num_stochastic_passes):
-            current_pass_predictions = []
-            for params in self.list_of_parameters:
-                # messing with state dict names...
-                if not isinstance(self.network, OptimizedModule):
-                    self.network.load_state_dict(params)
-                else:
-                    self.network._orig_mod.load_state_dict(params)
-                
-                current_model_prediction = self.predict_sliding_window_return_logits(data).to('cpu')
-                current_pass_predictions.append(current_model_prediction)
-
-            if not current_pass_predictions: # Should not happen if list_of_parameters is not empty
-                if self.verbose: print('No parameters found, returning empty prediction.')
-                torch.set_num_threads(n_threads)
-                return torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]), device='cpu'), \
-                       torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]), device='cpu')
-
-
-            # Average predictions if ensembling models for the current stochastic pass
-            if len(current_pass_predictions) > 1:
-                current_pass_prediction_ensembled = torch.stack(current_pass_predictions).mean(dim=0)
-            else:
-                current_pass_prediction_ensembled = current_pass_predictions[0]
+        # Outer loop: Iterate through each ensemble member
+        # self.list_of_list_of_parameters contains a list of (lists of parameters for folds) for each model
+        for member_idx, member_fold_params_list in enumerate(self.list_of_list_of_parameters):
+            if self.verbose: print(f"Predicting with ensemble member {member_idx + 1}/{len(self.list_of_list_of_parameters)}")
             
-            all_predictions.append(current_pass_prediction_ensembled)
+            member_fold_logits_list = []
+            # Inner loop: Iterate through folds for the current member
+            for fold_idx, fold_params in enumerate(member_fold_params_list):
+                if self.verbose: print(f"  Folder {fold_idx + 1}/{len(member_fold_params_list)}")
+                
+                # Load parameters for the current fold of the current member
+                if not isinstance(self.network, OptimizedModule):
+                    self.network.load_state_dict(fold_params)
+                else:
+                    self.network._orig_mod.load_state_dict(fold_params)
+                
+                # Logic for stochastic passes (MC Dropout)
+                stochastic_pass_logits_list = []
+                for _ in range(self.num_stochastic_passes):
+                    # predict_sliding_window_return_logits already handles train() mode if num_stochastic_passes > 1 in _internal_maybe_mirror_and_predict
+                    current_stochastic_pass_logits = self.predict_sliding_window_return_logits(data).to('cpu')
+                    stochastic_pass_logits_list.append(current_stochastic_pass_logits)
+                
+                if not stochastic_pass_logits_list: # Should not happen
+                     # This case implies num_stochastic_passes was 0 or less, which shouldn't occur with default = 1
+                    if self.verbose: print(f"  No stochastic passes for fold {fold_idx}, member {member_idx}. Skipping.")
+                    continue # Or handle error appropriately
 
-        all_predictions_tensor = torch.stack(all_predictions)
+                # Average logits from stochastic passes for the current fold
+                fold_mean_logits = torch.mean(torch.stack(stochastic_pass_logits_list), dim=0)
+                member_fold_logits_list.append(fold_mean_logits)
 
-        # Calculate Mean Logits
-        mean_logits = torch.mean(all_predictions_tensor, dim=0)
+            if not member_fold_logits_list: # Should not happen if parameters were loaded
+                if self.verbose: print(f"No fold predictions for member {member_idx}. Skipping this member.")
+                continue # Or handle error
 
-        # Calculate Variance
-        # Probabilities have shape [T, C, H, W, D] or [T, C, H, W]
-        probabilities = torch.softmax(all_predictions_tensor, dim=2) # dim=2 because 0 is T, 1 is num_models (already averaged), 2 is C 
-        variance_map = torch.var(probabilities, dim=0)
-        # The variance_map will have shape [C, H, W, D] or [C, H, W]
+            # Average logits across folds for the current member
+            member_mean_logits = torch.mean(torch.stack(member_fold_logits_list), dim=0)
+            
+            # Convert member's mean logits to probabilities
+            member_probabilities = torch.softmax(member_mean_logits, dim=0) # Softmax over channel dimension (dim=0 for [C,H,W,D])
+            all_member_probabilities.append(member_probabilities)
 
-        if self.verbose: print('Prediction done')
+        if not all_member_probabilities:
+            if self.verbose: print('No predictions from any ensemble member. Returning empty prediction.')
+            # Return shapes consistent with expected output (num_classes, H, W, D)
+            # Assuming data is (C_in, H, W, D), output should be (C_out, H, W, D) for probs/variance
+            return torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]), device='cpu'), \
+                   torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]), device='cpu')
+
+        # Stack probabilities from all members: shape becomes [Num_members, C, H, W, D]
+        stacked_member_probabilities = torch.stack(all_member_probabilities, dim=0)
+        
+        # Average probabilities across all members
+        ensembled_probabilities = torch.mean(stacked_member_probabilities, dim=0)
+        
+        # Calculate variance of probabilities across members
+        variance_of_probabilities = torch.var(stacked_member_probabilities, dim=0)
+
+        if self.verbose: print('Ensemble prediction done')
         torch.set_num_threads(n_threads)
-        return mean_logits, variance_map
+        # Return ensembled probabilities and the variance of these probabilities
+        return ensembled_probabilities, variance_of_probabilities 
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []

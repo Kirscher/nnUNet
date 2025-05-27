@@ -28,12 +28,25 @@ def find_free_network_port() -> int:
     s.close()
     return port
 
+def set_random_seeds(seed: Optional[int]):
+    if seed is not None:
+        import random
+        import numpy as np
+        import torch
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
 
 def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                           configuration: str,
                           fold: int,
                           trainer_name: str = 'nnUNetTrainer',
                           plans_identifier: str = 'nnUNetPlans',
+                          seed: Optional[int] = None,
+                          output_folder_suffix: Optional[str] = None, # New argument
                           device: torch.device = torch.device('cuda')):
     # load nnunet class and do sanity checks
     nnunet_trainer = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
@@ -63,7 +76,9 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
     plans = load_json(plans_file)
     dataset_json = load_json(join(preprocessed_dataset_folder_base, 'dataset.json'))
     nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
-                                    dataset_json=dataset_json, device=device)
+                                    dataset_json=dataset_json, master_seed=seed,
+                                    output_folder_suffix=output_folder_suffix, # Pass suffix
+                                    device=device)
     return nnunet_trainer
 
 
@@ -107,30 +122,58 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 
-def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size):
+def run_ddp(rank, dataset_name_or_id, configuration, fold, trainer_class_name, plans_identifier,
+            disable_checkpointing_flag, continue_training_flag, only_run_validation_flag,
+            pretrained_weights_file, export_validation_probabilities_flag, val_with_best_flag,
+            world_size, seed, deterministic_augmentations, cudnn_deterministic_flag,
+            output_folder_suffix_ddp): # New argument for DDP
     setup_ddp(rank, world_size)
-    torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
+    torch.cuda.set_device(torch.device('cuda', rank))
 
-    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p)
+    if seed is not None:
+        set_random_seeds(seed + rank) # Offset seed by rank for DDP
 
-    if disable_checkpointing:
-        nnunet_trainer.disable_checkpointing = disable_checkpointing
+    if torch.cuda.is_available(): # This check is technically redundant here as DDP implies CUDA
+        if cudnn_deterministic_flag:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+    # No specific else for cudnn_deterministic_flag here, as DDP is CUDA-only.
+    # A warning would have been printed by the main process if CUDA was unavailable but flag was set.
 
-    assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
+    # Pass the correct device for DDP
+    current_device = torch.device('cuda', rank)
+    # Pass seed and output_folder_suffix to get_trainer_from_args for DDP
+    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
+                                           plans_identifier, seed=seed,
+                                           output_folder_suffix=output_folder_suffix_ddp, # Pass suffix
+                                           device=current_device)
 
-    maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights)
+    if hasattr(nnunet_trainer, 'set_deterministic_augmentations') and callable(
+            getattr(nnunet_trainer, 'set_deterministic_augmentations')):
+        nnunet_trainer.set_deterministic_augmentations(deterministic_augmentations)
+    elif deterministic_augmentations:
+        print(
+            f"Warning: --deterministic_augmentations was set, but the trainer {trainer_class_name} "
+            f"does not have a 'set_deterministic_augmentations' method."
+        )
 
-    if torch.cuda.is_available():
-        cudnn.deterministic = False
-        cudnn.benchmark = True
+    if disable_checkpointing_flag:
+        nnunet_trainer.disable_checkpointing = disable_checkpointing_flag
 
-    if not val:
+    assert not (continue_training_flag and only_run_validation_flag), \
+        f'Cannot set --c and --val flag at the same time. Dummy.'
+
+    maybe_load_checkpoint(nnunet_trainer, continue_training_flag, only_run_validation_flag, pretrained_weights_file)
+
+    if not only_run_validation_flag:
         nnunet_trainer.run_training()
 
-    if val_with_best:
+    if val_with_best_flag:
         nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
-    nnunet_trainer.perform_actual_validation(npz)
+    nnunet_trainer.perform_actual_validation(export_validation_probabilities_flag)
     cleanup_ddp()
 
 
@@ -145,6 +188,10 @@ def run_training(dataset_name_or_id: Union[str, int],
                  only_run_validation: bool = False,
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
+                 seed: Optional[int] = None,
+                 deterministic_augmentations: bool = False,
+                 cudnn_deterministic: bool = False,
+                 output_folder_suffix: Optional[str] = None, # New argument
                  device: torch.device = torch.device('cuda')):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -160,37 +207,68 @@ def run_training(dataset_name_or_id: Union[str, int],
                 print(f'Unable to convert given value for fold to int: {fold}. fold must bei either "all" or an integer!')
                 raise e
 
-    if val_with_best:
+    if val_with_best: # This check should be before DDP block
         assert not disable_checkpointing, '--val_best is not compatible with --disable_checkpointing'
 
     if num_gpus > 1:
         assert device.type == 'cuda', f"DDP training (triggered by num_gpus > 1) is only implemented for cuda devices. Your device: {device}"
-
         os.environ['MASTER_ADDR'] = 'localhost'
         if 'MASTER_PORT' not in os.environ.keys():
             port = str(find_free_network_port())
             print(f"using port {port}")
-            os.environ['MASTER_PORT'] = port  # str(port)
+            os.environ['MASTER_PORT'] = port
 
+        # Arguments for mp.spawn are already correctly ordered as per the previous diff.
+        # (dataset_name_or_id, configuration, fold, trainer_class_name, plans_identifier,
+        #  disable_checkpointing, continue_training, only_run_validation, pretrained_weights,
+        #  export_validation_probabilities, val_with_best, num_gpus,
+        #  seed, deterministic_augmentations, cudnn_deterministic)
         mp.spawn(run_ddp,
-                 args=(
-                     dataset_name_or_id,
-                     configuration,
-                     fold,
-                     trainer_class_name,
-                     plans_identifier,
-                     disable_checkpointing,
-                     continue_training,
-                     only_run_validation,
-                     pretrained_weights,
-                     export_validation_probabilities,
-                     val_with_best,
-                     num_gpus),
+                 args=(dataset_name_or_id,
+                       configuration,
+                       fold,
+                       trainer_class_name, # maps to trainer_class_name in run_ddp
+                       plans_identifier, # maps to plans_identifier in run_ddp
+                       disable_checkpointing, # maps to disable_checkpointing_flag
+                       continue_training,     # maps to continue_training_flag
+                       only_run_validation,   # maps to only_run_validation_flag
+                       pretrained_weights,    # maps to pretrained_weights_file
+                       export_validation_probabilities, # maps to export_validation_probabilities_flag
+                       val_with_best,         # maps to val_with_best_flag
+                       num_gpus,              # maps to world_size
+                       seed,                  # maps to seed
+                       deterministic_augmentations, # maps to deterministic_augmentations_flag
+                       cudnn_deterministic,   # maps to cudnn_deterministic_flag
+                       output_folder_suffix   # maps to output_folder_suffix_ddp
+                       ),
                  nprocs=num_gpus,
                  join=True)
-    else:
+    else: # Single GPU or CPU training
+        if seed is not None:
+            set_random_seeds(seed) # Set seeds before trainer initialization
+
+        if torch.cuda.is_available(): # Set CuDNN flags before trainer initialization
+            if cudnn_deterministic:
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+            else:
+                torch.backends.cudnn.deterministic = False
+                torch.backends.cudnn.benchmark = True
+        elif cudnn_deterministic: # if on CPU/MPS and cudnn_deterministic is set
+             print("Warning: --cudnn_deterministic is set, but no CUDA device is available. This flag only affects CuDNN.")
+
+        # Pass seed and output_folder_suffix to get_trainer_from_args for single GPU/CPU
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
-                                               plans_identifier, device=device)
+                                               plans_identifier, seed=seed,
+                                               output_folder_suffix=output_folder_suffix, # Pass suffix
+                                               device=device)
+
+        if hasattr(nnunet_trainer, 'set_deterministic_augmentations') and callable(
+            getattr(nnunet_trainer, 'set_deterministic_augmentations')):
+            nnunet_trainer.set_deterministic_augmentations(deterministic_augmentations)
+        elif deterministic_augmentations:
+            print(f"Warning: --deterministic_augmentations was set, but the trainer {trainer_class_name} "
+                  f"does not have a 'set_deterministic_augmentations' method.")
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -198,10 +276,6 @@ def run_training(dataset_name_or_id: Union[str, int],
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
         maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights)
-
-        if torch.cuda.is_available():
-            cudnn.deterministic = False
-            cudnn.benchmark = True
 
         if not only_run_validation:
             nnunet_trainer.run_training()
@@ -248,6 +322,14 @@ def run_training_entry():
                     help="Use this to set the device the training should run with. Available options are 'cuda' "
                          "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
                          "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_train [...] instead!")
+    parser.add_argument('--seed', type=int, default=None, required=False,
+                        help='[OPTIONAL] Set a global random seed for reproducibility. Default: None')
+    parser.add_argument('--deterministic_augmentations', action='store_true', required=False,
+                        help='[OPTIONAL] Set this flag to use deterministic data augmentations. Recommended for reproducibility.')
+    parser.add_argument('--cudnn_deterministic', action='store_true', required=False,
+                        help='[OPTIONAL] Set this flag to make CuDNN use deterministic algorithms. May impact performance. Recommended for reproducibility.')
+    parser.add_argument('--output_folder_suffix', type=str, default=None, required=False,
+                        help='[OPTIONAL] Suffix to append to the output folder name. Useful for ensemble member distinction.')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -266,6 +348,8 @@ def run_training_entry():
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
+                 args.seed, args.deterministic_augmentations, args.cudnn_deterministic,
+                 args.output_folder_suffix, # New argument
                  device=device)
 
 

@@ -9,21 +9,29 @@ from batchgenerators.utilities.file_and_folder_operations import load_json, isfi
 
 from nnunetv2.configuration import default_num_processes
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2
+from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 
 
-def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits: Union[torch.Tensor, np.ndarray],
-                                                                plans_manager: PlansManager,
-                                                                configuration_manager: ConfigurationManager,
-                                                                label_manager: LabelManager,
-                                                                properties_dict: dict,
-                                                                return_probabilities: bool = False,
-                                                                variance_map: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                                                                num_threads_torch: int = default_num_processes):
+def convert_probabilities_to_segmentation_with_correct_shape(
+        predicted_probabilities: Union[torch.Tensor, np.ndarray], # Renamed
+        plans_manager: PlansManager,
+        configuration_manager: ConfigurationManager,
+        label_manager: LabelManager,
+        properties_dict: dict,
+        return_probabilities_and_segmentation: bool = False, # Changed name and meaning
+        variance_map: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        num_threads_torch: int = default_num_processes): # New name
     old_threads = torch.get_num_threads()
     torch.set_num_threads(num_threads_torch)
 
+    # input is now assumed to be probabilities
+    if isinstance(predicted_probabilities, np.ndarray):
+        predicted_probabilities = torch.from_numpy(predicted_probabilities)
+
+    # derive segmentation before resampling
+    segmentation = label_manager.convert_probabilities_to_segmentation(predicted_probabilities)
     # Ensure variance_map is a tensor for consistent processing, if it exists
     if variance_map is not None and isinstance(variance_map, np.ndarray):
         variance_map = torch.from_numpy(variance_map)
@@ -39,29 +47,20 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
                        current_spacing,
                        [properties_dict['spacing'][i] for i in plans_manager.transpose_forward])
 
-    predicted_logits = configuration_manager.resampling_fn_probabilities(predicted_logits, *resampling_args)
+    # Resample probabilities, segmentation, and variance map (if present)
+    resampled_probabilities = configuration_manager.resampling_fn_probabilities(predicted_probabilities, *resampling_args)
+    resampled_segmentation = configuration_manager.resampling_fn_segmentation(segmentation, *resampling_args)
     
+    resampled_variance_map = None
     if variance_map is not None:
-        # Resample variance map similarly. Assuming it's float data, trilinear interp is fine.
-        # The resampling function might need to handle multi-channel data appropriately if variance_map is [C, H, W, D]
-        variance_map_resampled = configuration_manager.resampling_fn_probabilities(variance_map, *resampling_args)
-
-
-    # return value of resampling_fn_probabilities can be ndarray or Tensor but that does not matter because
-    # apply_inference_nonlin will convert to torch
-    if not return_probabilities:
-        # this has a faster computation path becasue we can skip the softmax in regular (not region based) trainig
-        segmentation = label_manager.convert_logits_to_segmentation(predicted_logits)
-    else:
-        predicted_probabilities = label_manager.apply_inference_nonlin(predicted_logits)
-        segmentation = label_manager.convert_probabilities_to_segmentation(predicted_probabilities)
-    del predicted_logits
+        resampled_variance_map = configuration_manager.resampling_fn_probabilities(variance_map, *resampling_args)
 
     # put segmentation in bbox (revert cropping)
     segmentation_reverted_cropping = np.zeros(properties_dict['shape_before_cropping'],
                                               dtype=np.uint8 if len(label_manager.foreground_labels) < 255 else np.uint16)
-    segmentation_reverted_cropping = insert_crop_into_image(segmentation_reverted_cropping, segmentation, properties_dict['bbox_used_for_cropping'])
-    del segmentation
+    segmentation_reverted_cropping = insert_crop_into_image(segmentation_reverted_cropping, resampled_segmentation,
+                                                            properties_dict['bbox_used_for_cropping'])
+    del resampled_segmentation
 
     # segmentation may be torch.Tensor but we continue with numpy
     if isinstance(segmentation_reverted_cropping, torch.Tensor):
@@ -71,115 +70,108 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
     segmentation_reverted_cropping = segmentation_reverted_cropping.transpose(plans_manager.transpose_backward)
 
     # Prepare return values
-    return_values = [segmentation_reverted_cropping]
-
-    if return_probabilities:
-        # revert cropping for probabilities
-        predicted_probabilities = label_manager.revert_cropping_on_probabilities(predicted_probabilities,
-                                                                                 properties_dict[
-                                                                                     'bbox_used_for_cropping'],
-                                                                                 properties_dict[
-                                                                                     'shape_before_cropping'])
-        predicted_probabilities = predicted_probabilities.cpu().numpy()
-        # revert transpose for probabilities
-        predicted_probabilities = predicted_probabilities.transpose([0] + [i + 1 for i in
-                                                                           plans_manager.transpose_backward])
-        return_values.append(predicted_probabilities)
-
-    if variance_map is not None:
-        # Revert cropping for variance map
-        # Assuming variance_map_resampled is a tensor [C, H, W, D] or [C, H, W]
-        # Need a similar revert_cropping_on_probabilities or adapt it if it works for generic multi-channel data
-        variance_map_reverted_cropping = label_manager.revert_cropping_on_probabilities(
-            variance_map_resampled,
+    # The first element is always the segmentation
+    return_values = [segmentation_reverted_cropping] 
+    
+    # Handle probabilities
+    if return_probabilities_and_segmentation:
+        # Probabilities are already resampled, now revert cropping and transpose
+        resampled_probabilities = label_manager.revert_cropping_on_probabilities(
+            resampled_probabilities, # Use the resampled version
             properties_dict['bbox_used_for_cropping'],
             properties_dict['shape_before_cropping']
         )
-        variance_map_reverted_cropping = variance_map_reverted_cropping.cpu().numpy()
-        # Revert transpose for variance map
-        variance_map_reverted_cropping = variance_map_reverted_cropping.transpose([0] + [i + 1 for i in
-                                                                                    plans_manager.transpose_backward])
-        return_values.append(variance_map_reverted_cropping)
+        resampled_probabilities = resampled_probabilities.cpu().numpy()
+        resampled_probabilities = resampled_probabilities.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
+        return_values.append(resampled_probabilities)
+
+    # Handle variance map
+    if variance_map is not None:
+        # Variance map is already resampled, now revert cropping and transpose
+        resampled_variance_map = label_manager.revert_cropping_on_probabilities(
+            resampled_variance_map, # Use the resampled version
+            properties_dict['bbox_used_for_cropping'],
+            properties_dict['shape_before_cropping']
+        )
+        resampled_variance_map = resampled_variance_map.cpu().numpy()
+        resampled_variance_map = resampled_variance_map.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
+        return_values.append(resampled_variance_map)
         
     torch.set_num_threads(old_threads)
     
     if len(return_values) == 1:
-        return return_values[0]
+        return return_values[0] # Only segmentation
     else:
         return tuple(return_values)
 
 
-def export_prediction_from_logits(predicted_logits: Union[np.ndarray, torch.Tensor], properties_dict: dict,
-                                  configuration_manager: ConfigurationManager,
-                                  plans_manager: PlansManager,
-                                  dataset_json_dict_or_file: Union[dict, str], output_file_truncated: str,
-                                  save_probabilities: bool = False,
-                                  variance_map: Union[np.ndarray, torch.Tensor] = None,
-                                  num_threads_torch: int = default_num_processes):
-    # if isinstance(predicted_logits, str):
-    #     tmp = deepcopy(predicted_logits)
-    #     if predicted_logits.endswith('.npy'):
-    #         predicted_logits = np.load(predicted_logits)
-    #     elif predicted_logits.endswith('.npz'):
-    #         predicted_logits = np.load(predicted_logits)['softmax']
-    #     os.remove(tmp)
+def export_prediction_from_probabilities( # Renamed
+        predicted_probabilities: Union[np.ndarray, torch.Tensor], # Renamed
+        properties_dict: dict,
+        configuration_manager: ConfigurationManager,
+        plans_manager: PlansManager,
+        dataset_json_dict_or_file: Union[dict, str],
+        output_file_truncated: str,
+        save_prediction_npz: bool = False, # Renamed
+        variance_map: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        num_threads_torch: int = default_num_processes):
 
     if isinstance(dataset_json_dict_or_file, str):
         dataset_json_dict_or_file = load_json(dataset_json_dict_or_file)
 
     label_manager = plans_manager.get_label_manager(dataset_json_dict_or_file)
-    ret = convert_predicted_logits_to_segmentation_with_correct_shape(
-        predicted_logits, plans_manager, configuration_manager, label_manager, properties_dict,
-        return_probabilities=save_probabilities, num_threads_torch=num_threads_torch,
-        variance_map=variance_map # Pass variance_map here
-    )
-    # del predicted_logits # We might need it if save_probabilities is true, for the npz file
-
-    # save
-    if save_probabilities:
-        if variance_map is not None:
-            segmentation_final, probabilities_final, variance_map_final = ret
-            np.savez_compressed(output_file_truncated + '.npz', probabilities=probabilities_final, variance=variance_map_final)
-            save_pickle(properties_dict, output_file_truncated + '.pkl') # Save properties once
-            del probabilities_final, variance_map_final
-        else:
-            segmentation_final, probabilities_final = ret
-            np.savez_compressed(output_file_truncated + '.npz', probabilities=probabilities_final)
-            save_pickle(properties_dict, output_file_truncated + '.pkl')
-            del probabilities_final
-    else: # not save_probabilities
-        if variance_map is not None: # variance can be present even if not saving probabilities
-            segmentation_final, variance_map_final = ret # Expecting two return values now
-            # Save variance map separately if it's provided and not saving probabilities (as it's not in the npz)
-            variance_filename = output_file_truncated + "_variance" + dataset_json_dict_or_file['file_ending']
-            rw_variance = plans_manager.image_reader_writer_class() # Or appropriate writer for multi-channel float data
-            # The variance map needs to be resampled and transposed like the segmentation/probabilities.
-            # This logic is handled in convert_predicted_logits_to_segmentation_with_correct_shape
-            # Ensure variance_map_final is what you expect (numpy array, correct orientation)
-            rw_variance.write_seg(variance_map_final, variance_filename, properties_dict) # May need a different writer if not int seg
-            del variance_map_final
-        else:
-            segmentation_final = ret
     
-    del ret # delete ret at the end
+    # convert_probabilities_to_segmentation_with_correct_shape now returns a tuple
+    # The first element is always segmentation.
+    # If return_probabilities_and_segmentation is True, probabilities are the second.
+    # If variance_map is provided, it's the next.
+    processed_outputs = convert_probabilities_to_segmentation_with_correct_shape(
+        predicted_probabilities, plans_manager, configuration_manager, label_manager, properties_dict,
+        return_probabilities_and_segmentation=save_prediction_npz, # Pass new flag
+        variance_map=variance_map,
+        num_threads_torch=num_threads_torch
+    )
 
+    segmentation_final = processed_outputs[0]
+    
+    # Save the segmentation (NIfTI or other formats)
     rw = plans_manager.image_reader_writer_class()
     rw.write_seg(segmentation_final, output_file_truncated + dataset_json_dict_or_file['file_ending'],
                  properties_dict)
-    
-    # Clean up predicted_logits if it's a large array and no longer needed.
-    del predicted_logits
-    if variance_map is not None and not save_probabilities: # If variance map was handled and saved separately
-        pass # variance_map_final was already deleted
-    elif variance_map is not None: # If passed but not handled by a specific path yet (e.g. save_probabilities=False but variance still needs saving)
-        # This case should ideally be covered by the logic above.
-        # If variance map is returned by convert_predicted_logits_to_segmentation_with_correct_shape
-        # and not saved with probabilities, it needs its own saving mechanism.
-        # This is somewhat redundant with the save_probabilities=False, variance_map is not None block
-        pass
 
+    # Handle NPZ saving
+    if save_prediction_npz:
+        npz_dict = {'segmentation': segmentation_final}
+        idx = 1
+        if save_prediction_npz : # This check is redundant due to outer if, but explicit. Probabilities were requested.
+            npz_dict['probabilities'] = processed_outputs[idx]
+            idx +=1
+        
+        if variance_map is not None:
+            npz_dict['variance_map'] = processed_outputs[idx]
+            
+        np.savez_compressed(output_file_truncated + '.npz', **npz_dict)
+        save_pickle(properties_dict, output_file_truncated + '.pkl') # Save properties for the .npz
 
-
+    # Handle separate variance map NIfTI saving if NPZ wasn't saved but variance is present
+    elif variance_map is not None: 
+        # variance_map would be the second element if save_prediction_npz was False
+        variance_map_final = processed_outputs[1] 
+        variance_filename = output_file_truncated + "_variance" + dataset_json_dict_or_file['file_ending']
+        
+        # Create a temporary properties_dict for variance map, potentially with adjusted channel info
+        variance_properties_dict = deepcopy(properties_dict)
+        # Assuming variance map is single channel or multi-channel float data.
+        # The writer needs to handle this. For SimpleITK, it might save multi-channel as vector image.
+        # If variance is per class, it will have C channels.
+        
+        # We need a writer that can save float data. SimpleITKIO should handle this.
+        # We assume variance_map_final is already correctly oriented (transposed back)
+        variance_rw = SimpleITKIO() # Using SimpleITKIO directly, or plans_manager.image_reader_writer_class() if it's suitable for float
+        variance_rw.write_seg(variance_map_final, variance_filename, variance_properties_dict) # write_seg might work for float if underlying lib supports it
+        # Alternatively, a more generic write_nifti_from_numpy or similar might be needed if write_seg is strictly for int labels.
+        # For now, assuming write_seg can handle it or will be adapted.
+        # print(f"Saved variance map to {variance_filename}") # Optional: for debugging
 
 def resample_and_save(predicted: Union[torch.Tensor, np.ndarray], target_shape: List[int], output_file: str,
                       plans_manager: PlansManager, configuration_manager: ConfigurationManager, properties_dict: dict,

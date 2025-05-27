@@ -69,6 +69,8 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 master_seed: Optional[int] = None,
+                 output_folder_suffix: Optional[str] = None, # New argument
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
@@ -120,11 +122,19 @@ class nnUNetTrainer(object):
 
         ### Setting all the folder names. We need to make sure things don't crash in case we are just running
         # inference and some of the folders may not be defined!
+        self.output_folder_suffix = output_folder_suffix
         self.preprocessed_dataset_folder_base = join(nnUNet_preprocessed, self.plans_manager.dataset_name) \
             if nnUNet_preprocessed is not None else None
-        self.output_folder_base = join(nnUNet_results, self.plans_manager.dataset_name,
+        
+        base_output_folder = join(nnUNet_results, self.plans_manager.dataset_name,
                                        self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration) \
             if nnUNet_results is not None else None
+
+        if self.output_folder_suffix is not None:
+            self.output_folder_base = join(base_output_folder, self.output_folder_suffix)
+        else:
+            self.output_folder_base = base_output_folder
+            
         self.output_folder = join(self.output_folder_base, f'fold_{fold}')
 
         self.preprocessed_dataset_folder = join(self.preprocessed_dataset_folder_base,
@@ -196,6 +206,8 @@ class nnUNetTrainer(object):
                                "Nature methods, 18(2), 203-211.\n"
                                "#######################################################################\n",
                                also_print_to_console=True, add_timestamp=False)
+        self.master_seed = master_seed
+        self.deterministic_augmentations = False # Initialize here
 
     def initialize(self):
         if not self.was_initialized:
@@ -673,23 +685,65 @@ class nnUNetTrainer(object):
                                   probabilistic_oversampling=self.probabilistic_oversampling)
 
         allowed_num_processes = get_allowed_n_proc_DA()
+
         if allowed_num_processes == 0:
+            # SingleThreadedAugmenter does not consume seeds in its constructor.
+            # Seeding of np/random for transformations is handled by global seed set in run_training.
+            if self.deterministic_augmentations and self.master_seed is None:
+                self.print_to_log_file("WARNING: Deterministic augmentations requested with SingleThreadedAugmenter, "
+                                       "but no master seed was provided to the trainer. "
+                                       "Augmentations may not be fully deterministic if global seeds are not set in run_training.py.",
+                                       also_print_to_console=True)
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
             mt_gen_val = SingleThreadedAugmenter(dl_val, None)
         else:
-            mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
-                                                        num_processes=allowed_num_processes,
-                                                        num_cached=max(6, allowed_num_processes // 2), seeds=None,
-                                                        pin_memory=self.device.type == 'cuda', wait_time=0.002)
-            mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
-                                                      transform=None, num_processes=max(1, allowed_num_processes // 2),
-                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
-                                                      pin_memory=self.device.type == 'cuda',
-                                                      wait_time=0.002)
+            if self.deterministic_augmentations:
+                if self.master_seed is None:
+                    self.print_to_log_file("WARNING: Deterministic augmentations requested for MultiThreadedAugmenter "
+                                           "but no master_seed was provided to the trainer. "
+                                           "Using default seed 0 for worker seeds. This might lead to "
+                                           "collisions if multiple trainers run with this configuration.", also_print_to_console=True)
+                    # Consider raising an error or using a more robust default seed generation strategy
+                    used_master_seed = 0 
+                else:
+                    used_master_seed = self.master_seed
+
+                num_processes_train = allowed_num_processes
+                num_processes_val = max(1, allowed_num_processes // 2)
+                
+                train_worker_seeds = [used_master_seed + i for i in range(num_processes_train)]
+                # Ensure validation seeds are distinct from training seeds
+                val_worker_seeds = [used_master_seed + num_processes_train + i for i in range(num_processes_val)]
+
+                mt_gen_train = MultiThreadedAugmenter(data_loader=dl_tr, transform=None,
+                                                      num_processes=num_processes_train,
+                                                      num_cached=max(6, num_processes_train // 2),
+                                                      seeds=train_worker_seeds,
+                                                      pin_memory=self.device.type == 'cuda', wait_time=0.002)
+                mt_gen_val = MultiThreadedAugmenter(data_loader=dl_val, transform=None,
+                                                    num_processes=num_processes_val,
+                                                    num_cached=max(3, num_processes_val // 4),
+                                                    seeds=val_worker_seeds,
+                                                    pin_memory=self.device.type == 'cuda', wait_time=0.002)
+                self.print_to_log_file(f"Using MultiThreadedAugmenter with seeds for deterministic augmentations. Master seed for workers: {used_master_seed}", also_print_to_console=True)
+
+            else: # Non-deterministic augmentations
+                mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
+                                                            num_processes=allowed_num_processes,
+                                                            num_cached=max(6, allowed_num_processes // 2), seeds=None, # seeds=None for NonDet
+                                                            pin_memory=self.device.type == 'cuda', wait_time=0.002)
+                mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
+                                                          transform=None, num_processes=max(1, allowed_num_processes // 2),
+                                                          num_cached=max(3, allowed_num_processes // 4), seeds=None, # seeds=None for NonDet
+                                                          pin_memory=self.device.type == 'cuda',
+                                                          wait_time=0.002)
         # # let's get this party started
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
+
+    def set_deterministic_augmentations(self, enable: bool):
+        self.deterministic_augmentations = enable
 
     @staticmethod
     def get_training_transforms(
