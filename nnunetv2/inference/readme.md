@@ -219,3 +219,27 @@ cons:
     ret = predictor.predict_from_data_iterator(my_iterator([img, img2, img3, img4], [props, props2, props3, props4]),
                                                save_probabilities=False, num_processes_segmentation_export=3)
 ```
+
+## Uncertainty quantification
+
+`nnunetv2` also includes helper functions for measuring prediction uncertainty
+using Monte Carlo Dropout, deep ensembling and explicit test time augmentation.
+
+```python
+from nnunetv2.inference import (
+    mc_dropout_prediction,
+    deep_ensemble_prediction,
+    tta_prediction,
+)
+
+# Monte Carlo Dropout
+mean, var = mc_dropout_prediction(predictor, data, num_samples=8)
+
+# Deep ensemble
+mean, var = deep_ensemble_prediction([pred1, pred2], data)
+
+# Test time augmentation
+mean, var = tta_prediction(predictor, data)
+```
+
+The functions return the averaged logits and the voxel-wise variance.
